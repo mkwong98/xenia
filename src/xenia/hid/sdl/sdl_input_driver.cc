@@ -507,18 +507,26 @@ void SDLInputDriver::OnControllerDeviceAxisMotion(const SDL_Event& event) {
   auto idx = GetControllerIndexFromInstanceID(event.caxis.which);
   assert(idx);
   auto& pad = controllers_.at(*idx).state.gamepad;
+  Sint16 adjustedValue;
+  if (event.caxis.value < 6554 && event.caxis.value > -6554) {
+    adjustedValue = 0;
+  } else if (event.caxis.value >= 6554) {
+    adjustedValue = int((event.caxis.value - 6554) * 1.2);
+  } else {
+    adjustedValue = int((event.caxis.value + 6554) * 1.2);
+  }
   switch (event.caxis.axis) {
     case SDL_CONTROLLER_AXIS_LEFTX:
-      pad.thumb_lx = event.caxis.value;
+      pad.thumb_lx = adjustedValue;
       break;
     case SDL_CONTROLLER_AXIS_LEFTY:
-      pad.thumb_ly = ~event.caxis.value;
+      pad.thumb_ly = ~adjustedValue;
       break;
     case SDL_CONTROLLER_AXIS_RIGHTX:
-      pad.thumb_rx = event.caxis.value;
+      pad.thumb_rx = adjustedValue;
       break;
     case SDL_CONTROLLER_AXIS_RIGHTY:
-      pad.thumb_ry = ~event.caxis.value;
+      pad.thumb_ry = ~adjustedValue;
       break;
     case SDL_CONTROLLER_AXIS_TRIGGERLEFT:
       pad.left_trigger = static_cast<uint8_t>(event.caxis.value >> 7);
