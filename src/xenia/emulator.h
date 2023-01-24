@@ -21,6 +21,8 @@
 #include "xenia/base/exception_handler.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/memory.h"
+#include "xenia/patcher/patcher.h"
+#include "xenia/vfs/device.h"
 #include "xenia/vfs/virtual_file_system.h"
 #include "xenia/xbox.h"
 
@@ -154,6 +156,8 @@ class Emulator {
   // This is effectively the guest operating system.
   kernel::KernelState* kernel_state() const { return kernel_state_.get(); }
 
+  patcher::Patcher* patcher() const { return patcher_.get(); }
+
   // Initializes the emulator and configures all components.
   // The given window is used for display and the provided functions are used
   // to create subsystems as required.
@@ -172,6 +176,11 @@ class Emulator {
   // Terminates the currently running title.
   X_STATUS TerminateTitle();
 
+const std::unique_ptr<vfs::Device> CreateVfsDeviceBasedOnPath(
+      const std::filesystem::path& path, const std::string_view mount_path);
+
+  X_STATUS MountPath(const std::filesystem::path& path,
+                     const std::string_view mount_path);
   // Launches a game from the given file path.
   // This will attempt to infer the type of the given file (such as an iso, etc)
   // using heuristics.
@@ -187,6 +196,9 @@ class Emulator {
   // Launches a game from an STFS container file.
   X_STATUS LaunchStfsContainer(const std::filesystem::path& path);
 
+  // Extract content of package to content specific directory.
+  X_STATUS InstallContentPackage(const std::filesystem::path& path);
+
   void Pause();
   void Resume();
   bool is_paused() const { return paused_; }
@@ -197,12 +209,14 @@ class Emulator {
   // The game can request another title to be loaded.
   bool TitleRequested();
   void LaunchNextTitle();
+  const std::filesystem::path GetNewDiscPath(std::string window_message = "");
 
   void WaitUntilExit();
 
  public:
   xe::Delegate<uint32_t, const std::string_view> on_launch;
   xe::Delegate<bool> on_shader_storage_initialization;
+  xe::Delegate<> on_patch_apply;
   xe::Delegate<> on_terminate;
   xe::Delegate<> on_exit;
 
@@ -238,6 +252,7 @@ class Emulator {
 
   std::unique_ptr<cpu::ExportResolver> export_resolver_;
   std::unique_ptr<vfs::VirtualFileSystem> file_system_;
+  std::unique_ptr<patcher::Patcher> patcher_;
 
   std::unique_ptr<kernel::KernelState> kernel_state_;
 

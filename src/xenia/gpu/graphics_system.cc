@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <algorithm>
+
 #include "xenia/gpu/graphics_system.h"
 
 #include <cstdint>
@@ -48,7 +50,11 @@ __declspec(dllexport) uint32_t AmdPowerXpressRequestHighPerformance = 1;
 }  // extern "C"
 #endif  // XE_PLATFORM_WIN32
 
-GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {}
+GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {
+  register_file_ = reinterpret_cast<RegisterFile*>(memory::AllocFixed(
+      nullptr, sizeof(RegisterFile), memory::AllocationType::kReserveCommit,
+      memory::PageAccess::kReadWrite));
+}
 
 GraphicsSystem::~GraphicsSystem() = default;
 
@@ -98,7 +104,8 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   vsync_worker_running_ = true;
   vsync_worker_thread_ = kernel::object_ref<kernel::XHostThread>(
       new kernel::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
-        uint64_t vsync_duration = cvars::vsync ? 16 : 1;
+        uint64_t vsync_duration =
+            cvars::vsync ? std::max<uint64_t>(5, cvars::vsync_interval) : 1;
         uint64_t last_frame_time = Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
           uint64_t current_time = Clock::QueryGuestTickCount();
@@ -195,13 +202,13 @@ uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
                   // maximum [width(0x0FFF), height(0x0FFF)]
       return 0x050002D0;
     default:
-      if (!register_file_.GetRegisterInfo(r)) {
+      if (!register_file()->IsValidRegister(r)) {
         XELOGE("GPU: Read from unknown register ({:04X})", r);
       }
   }
 
   assert_true(r < RegisterFile::kRegisterCount);
-  return register_file_.values[r].u32;
+  return register_file()->values[r].u32;
 }
 
 void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
@@ -219,7 +226,7 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
   }
 
   assert_true(r < RegisterFile::kRegisterCount);
-  register_file_.values[r].u32 = value;
+  this->register_file()->values[r].u32 = value;
 }
 
 void GraphicsSystem::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {

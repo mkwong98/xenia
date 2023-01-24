@@ -106,7 +106,6 @@ std::vector<XdbfAchievementTableEntry> XdbfWrapper::GetAchievements() const {
     achievements.push_back(*entry);
   }
   return achievements;
-
 }
 
 XLanguage XdbfGameData::GetExistingLanguage(XLanguage language_to_check) const {

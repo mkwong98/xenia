@@ -41,6 +41,7 @@
 #include "xenia/kernel/xbdm/xbdm_module.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_module.h"
 #include "xenia/memory.h"
+#include "xenia/ui/file_picker.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/window.h"
@@ -49,7 +50,6 @@
 #include "xenia/vfs/devices/host_path_device.h"
 #include "xenia/vfs/devices/null_device.h"
 #include "xenia/vfs/devices/stfs_container_device.h"
-#include "xenia/vfs/virtual_file_system.h"
 
 #if XE_ARCH_AMD64
 #include "xenia/cpu/backend/x64/x64_backend.h"
@@ -66,9 +66,13 @@ DEFINE_string(
     "or the module specified by the game. Leave blank to launch the default "
     "module.",
     "General");
+DEFINE_bool(allow_game_relative_writes, false,
+            "Not useful to non-developers. Allows code to write to paths "
+            "relative to game://. Used for "
+            "generating test data to compare with original hardware. ",
+            "General");
 
 namespace xe {
-
 using namespace xe::literals;
 
 Emulator::GameConfigLoadCallback::GameConfigLoadCallback(Emulator& emulator)
@@ -228,6 +232,8 @@ X_STATUS Emulator::Setup(
   // Bring up the virtual filesystem used by the kernel.
   file_system_ = std::make_unique<xe::vfs::VirtualFileSystem>();
 
+  patcher_ = std::make_unique<xe::patcher::Patcher>(storage_root_);
+
   // Shared kernel state.
   kernel_state_ = std::make_unique<xe::kernel::KernelState>(this);
 
@@ -274,19 +280,57 @@ X_STATUS Emulator::TerminateTitle() {
   return X_STATUS_SUCCESS;
 }
 
+const std::unique_ptr<vfs::Device> Emulator::CreateVfsDeviceBasedOnPath(
+    const std::filesystem::path& path, const std::string_view mount_path) {
+  if (!path.has_extension()) {
+    return std::make_unique<vfs::StfsContainerDevice>(mount_path, path);
+  }
+  auto extension = xe::utf8::lower_ascii(xe::path_to_utf8(path.extension()));
+  if (extension == ".xex" || extension == ".elf" || extension == ".exe") {
+    auto parent_path = path.parent_path();
+    return std::make_unique<vfs::HostPathDevice>(
+        mount_path, parent_path, !cvars::allow_game_relative_writes);
+  } else {
+    return std::make_unique<vfs::DiscImageDevice>(mount_path, path);
+  }
+}
+
+X_STATUS Emulator::MountPath(const std::filesystem::path& path,
+                             const std::string_view mount_path) {
+  auto device = CreateVfsDeviceBasedOnPath(path, mount_path);
+  if (!device->Initialize()) {
+    xe::FatalError("Unable to mount {}; file not found or corrupt.");
+    return X_STATUS_NO_SUCH_FILE;
+  }
+  if (!file_system_->RegisterDevice(std::move(device))) {
+    xe::FatalError("Unable to register {}.");
+    return X_STATUS_NO_SUCH_FILE;
+  }
+
+  file_system_->UnregisterSymbolicLink("d:");
+  file_system_->UnregisterSymbolicLink("game:");
+  // Create symlinks to the device.
+  file_system_->RegisterSymbolicLink("game:", mount_path);
+  file_system_->RegisterSymbolicLink("d:", mount_path);
+  return X_STATUS_SUCCESS;
+}
+
 X_STATUS Emulator::LaunchPath(const std::filesystem::path& path) {
   // Launch based on file type.
   // This is a silly guess based on file extension.
   if (!path.has_extension()) {
     // Likely an STFS container.
+    MountPath(path, "\\Device\\Cdrom0");
     return LaunchStfsContainer(path);
   };
   auto extension = xe::utf8::lower_ascii(xe::path_to_utf8(path.extension()));
   if (extension == ".xex" || extension == ".elf" || extension == ".exe") {
     // Treat as a naked xex file.
+    MountPath(path, "\\Device\\Harddisk0\\Partition1");
     return LaunchXexFile(path);
   } else {
     // Assume a disc image.
+    MountPath(path, "\\Device\\Cdrom0");
     return LaunchDiscImage(path);
   }
 }
@@ -298,26 +342,6 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
   // \\Device\\Harddisk0\\Partition1
   // and then get that symlinked to game:\, so
   // -> game:\foo.xex
-
-  auto mount_path = "\\Device\\Harddisk0\\Partition1";
-
-  // Register the local directory in the virtual filesystem.
-  auto parent_path = path.parent_path();
-  auto device =
-      std::make_unique<vfs::HostPathDevice>(mount_path, parent_path, true);
-  if (!device->Initialize()) {
-    XELOGE("Unable to scan host path");
-    return X_STATUS_NO_SUCH_FILE;
-  }
-  if (!file_system_->RegisterDevice(std::move(device))) {
-    XELOGE("Unable to register host path");
-    return X_STATUS_NO_SUCH_FILE;
-  }
-
-  // Create symlinks to the device.
-  file_system_->RegisterSymbolicLink("game:", mount_path);
-  file_system_->RegisterSymbolicLink("d:", mount_path);
-
   // Get just the filename (foo.xex).
   auto file_name = path.filename();
 
@@ -327,49 +351,46 @@ X_STATUS Emulator::LaunchXexFile(const std::filesystem::path& path) {
 }
 
 X_STATUS Emulator::LaunchDiscImage(const std::filesystem::path& path) {
-  auto mount_path = "\\Device\\Cdrom0";
-
-  // Register the disc image in the virtual filesystem.
-  auto device = std::make_unique<vfs::DiscImageDevice>(mount_path, path);
-  if (!device->Initialize()) {
-    xe::FatalError("Unable to mount disc image; file not found or corrupt.");
-    return X_STATUS_NO_SUCH_FILE;
-  }
-  if (!file_system_->RegisterDevice(std::move(device))) {
-    xe::FatalError("Unable to register disc image.");
-    return X_STATUS_NO_SUCH_FILE;
-  }
-
-  // Create symlinks to the device.
-  file_system_->RegisterSymbolicLink("game:", mount_path);
-  file_system_->RegisterSymbolicLink("d:", mount_path);
-
-  // Launch the game.
   auto module_path(FindLaunchModule());
   return CompleteLaunch(path, module_path);
 }
 
 X_STATUS Emulator::LaunchStfsContainer(const std::filesystem::path& path) {
-  auto mount_path = "\\Device\\Cdrom0";
-
-  // Register the container in the virtual filesystem.
-  auto device = std::make_unique<vfs::StfsContainerDevice>(mount_path, path);
-  if (!device->Initialize()) {
-    xe::FatalError(
-        "Unable to mount STFS container; file not found or corrupt.");
-    return X_STATUS_NO_SUCH_FILE;
-  }
-  if (!file_system_->RegisterDevice(std::move(device))) {
-    xe::FatalError("Unable to register STFS container.");
-    return X_STATUS_NO_SUCH_FILE;
-  }
-
-  file_system_->RegisterSymbolicLink("game:", mount_path);
-  file_system_->RegisterSymbolicLink("d:", mount_path);
-
-  // Launch the game.
   auto module_path(FindLaunchModule());
   return CompleteLaunch(path, module_path);
+}
+
+X_STATUS Emulator::InstallContentPackage(const std::filesystem::path& path) {
+  std::unique_ptr<vfs::StfsContainerDevice> device =
+      std::make_unique<vfs::StfsContainerDevice>("", path);
+  if (!device->Initialize()) {
+    XELOGE("Failed to initialize device");
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  std::filesystem::path installation_path =
+      content_root() / fmt::format("{:08X}", device->title_id()) /
+      fmt::format("{:08X}", device->content_type()) / path.filename();
+
+  std::filesystem::path header_path =
+      content_root() / fmt::format("{:08X}", device->title_id()) / "Headers" /
+      fmt::format("{:08X}", device->content_type()) / path.filename();
+
+  if (std::filesystem::exists(installation_path)) {
+    // TODO(Gliniak): Popup
+    // Do you want to overwrite already existing data?
+  } else {
+    std::error_code error_code;
+    std::filesystem::create_directories(installation_path, error_code);
+    if (error_code) {
+      return error_code.value();
+    }
+  }
+
+  vfs::VirtualFileSystem::ExtractContentHeader(device.get(), header_path);
+
+  return vfs::VirtualFileSystem::ExtractContentFiles(device.get(),
+                                                     installation_path);
 }
 
 void Emulator::Pause() {
@@ -539,7 +560,35 @@ void Emulator::LaunchNextTitle() {
   auto xam = kernel_state()->GetKernelModule<kernel::xam::XamModule>("xam.xex");
   auto next_title = xam->loader_data().launch_path;
 
+  // Swap disk doesn't require reloading
+  // This function should be purged?
   CompleteLaunch("", next_title);
+}
+
+const std::filesystem::path Emulator::GetNewDiscPath(
+    std::string window_message) {
+  std::filesystem::path path = "";
+
+  auto file_picker = xe::ui::FilePicker::Create();
+  file_picker->set_mode(ui::FilePicker::Mode::kOpen);
+  file_picker->set_type(ui::FilePicker::Type::kFile);
+  file_picker->set_multi_selection(false);
+  file_picker->set_title(!window_message.empty() ? window_message
+                                                 : "Select Content Package");
+  file_picker->set_extensions({
+      {"Supported Files", "*.iso;*.xex;*.xcp;*.*"},
+      {"Disc Image (*.iso)", "*.iso"},
+      {"Xbox Executable (*.xex)", "*.xex"},
+      {"All Files (*.*)", "*.*"},
+  });
+
+  if (file_picker->Show()) {
+    auto selected_files = file_picker->selected_files();
+    if (!selected_files.empty()) {
+      path = selected_files[0];
+    }
+  }
+  return path;
 }
 
 bool Emulator::ExceptionCallbackThunk(Exception* ex, void* data) {
@@ -557,8 +606,8 @@ bool Emulator::ExceptionCallback(Exception* ex) {
     // debugger.
     return false;
   } else if (processor()->is_debugger_attached()) {
-    // Let the debugger handle this exception. It may decide to continue past it
-    // (if it was a stepping breakpoint, etc).
+    // Let the debugger handle this exception. It may decide to continue past
+    // it (if it was a stepping breakpoint, etc).
     return processor()->OnUnhandledException(ex);
   }
 
@@ -579,36 +628,37 @@ bool Emulator::ExceptionCallback(Exception* ex) {
 
   auto context = current_thread->thread_state()->context();
 
-  XELOGE("==== CRASH DUMP ====");
-  XELOGE("Thread ID (Host: 0x{:08X} / Guest: 0x{:08X})",
-         current_thread->thread()->system_id(), current_thread->thread_id());
-  XELOGE("Thread Handle: 0x{:08X}", current_thread->handle());
-  XELOGE("PC: 0x{:08X}",
-         guest_function->MapMachineCodeToGuestAddress(ex->pc()));
-  XELOGE("Registers:");
+  std::string crash_msg;
+  crash_msg.append("==== CRASH DUMP ====\n");
+  crash_msg.append(fmt::format("Thread ID (Host: 0x{:08X} / Guest: 0x{:08X})\n",
+         current_thread->thread()->system_id(), current_thread->thread_id()));
+  crash_msg.append(fmt::format("Thread Handle: 0x{:08X}\n", current_thread->handle()));
+  crash_msg.append(fmt::format("PC: 0x{:08X}\n",
+         guest_function->MapMachineCodeToGuestAddress(ex->pc())));
+  crash_msg.append("Registers:\n");
   for (int i = 0; i < 32; i++) {
-    XELOGE(" r{:<3} = {:016X}", i, context->r[i]);
+    crash_msg.append(fmt::format(" r{:<3} = {:016X}\n", i, context->r[i]));
   }
   for (int i = 0; i < 32; i++) {
-    XELOGE(" f{:<3} = {:016X} = (double){} = (float){}", i,
+    crash_msg.append(fmt::format(" f{:<3} = {:016X} = (double){} = (float){}\n", i,
            *reinterpret_cast<uint64_t*>(&context->f[i]), context->f[i],
-           *(float*)&context->f[i]);
+           *(float*)&context->f[i]));
   }
   for (int i = 0; i < 128; i++) {
-    XELOGE(" v{:<3} = [0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]", i,
+    crash_msg.append(fmt::format(" v{:<3} = [0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]\n", i,
            context->v[i].u32[0], context->v[i].u32[1], context->v[i].u32[2],
-           context->v[i].u32[3]);
+           context->v[i].u32[3]));
   }
-
+  XELOGE("{}", crash_msg);
+  std::string crash_dlg = fmt::format(
+              "The guest has crashed.\n\n"
+              "Xenia has now paused itself.\n\n"
+              "{}", crash_msg);
   // Display a dialog telling the user the guest has crashed.
   if (display_window_ && imgui_drawer_) {
-    display_window_->app_context().CallInUIThreadSynchronous([this]() {
+    display_window_->app_context().CallInUIThreadSynchronous([this, &crash_dlg]() {
       xe::ui::ImGuiDialog::ShowMessageBox(
-          imgui_drawer_, "Uh-oh!",
-          "The guest has crashed.\n\n"
-          ""
-          "Xenia has now paused itself.\n"
-          "A crash dump has been written into the log.");
+          imgui_drawer_, "Uh-oh!", crash_dlg);
     });
   }
 
@@ -728,8 +778,8 @@ static std::string format_version(xex2_version version) {
 
 X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                                   const std::string_view module_path) {
-  // Making changes to the UI (setting the icon) and executing game config load
-  // callbacks which expect to be called from the UI thread.
+  // Making changes to the UI (setting the icon) and executing game config
+  // load callbacks which expect to be called from the UI thread.
   assert_true(display_window_->app_context().IsInUIThread());
 
   // Setup NullDevices for raw HDD partition accesses
@@ -737,12 +787,12 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   // By using a NullDevice that just returns success to all IO requests it
   // should allow games to believe cache/raw disk was accessed successfully
 
-  // NOTE: this should probably be moved to xenia_main.cc, but right now we need
-  // to register the \Device\Harddisk0\ NullDevice _after_ the
+  // NOTE: this should probably be moved to xenia_main.cc, but right now we
+  // need to register the \Device\Harddisk0\ NullDevice _after_ the
   // \Device\Harddisk0\Partition1 HostPathDevice, otherwise requests to
-  // Partition1 will go to this. Registering during CompleteLaunch allows us to
-  // make sure any HostPathDevices are ready beforehand.
-  // (see comment above cache:\ device registration for more info about why)
+  // Partition1 will go to this. Registering during CompleteLaunch allows us
+  // to make sure any HostPathDevices are ready beforehand. (see comment above
+  // cache:\ device registration for more info about why)
   auto null_paths = {std::string("\\Partition0"), std::string("\\Cache0"),
                      std::string("\\Cache1")};
   auto null_device =
@@ -760,16 +810,36 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   // Allow xam to request module loads.
   auto xam = kernel_state()->GetKernelModule<kernel::xam::XamModule>("xam.xex");
 
-  XELOGI("Launching module {}", module_path);
+  XELOGI("Loading module {}", module_path);
   auto module = kernel_state_->LoadUserModule(module_path);
   if (!module) {
     XELOGE("Failed to load user module {}", xe::path_to_utf8(path));
     return X_STATUS_NOT_FOUND;
   }
 
+  X_RESULT result = kernel_state_->ApplyTitleUpdate(module);
+  if (XFAILED(result)) {
+    XELOGE("Failed to apply title update! Cannot run module {}",
+           xe::path_to_utf8(path));
+    return result;
+  }
+
+  result = kernel_state_->FinishLoadingUserModule(module);
+  if (XFAILED(result)) {
+    XELOGE("Failed to initialize user module {}", xe::path_to_utf8(path));
+    return result;
+  }
   // Grab the current title ID.
   xex2_opt_execution_info* info = nullptr;
+  uint32_t workspace_address = 0;
   module->GetOptHeader(XEX_HEADER_EXECUTION_INFO, &info);
+
+  kernel_state_->memory()
+      ->LookupHeapByType(false, 0x1000)
+      ->Alloc(module->workspace_size(), 0x1000,
+              kMemoryAllocationReserve | kMemoryAllocationCommit,
+              kMemoryProtectRead | kMemoryProtectWrite, false,
+              &workspace_address);
 
   if (!info) {
     title_id_ = 0;
@@ -785,8 +855,8 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
   if (module->title_id()) {
     auto title_id = fmt::format("{:08X}", module->title_id());
 
-    // Load the per-game configuration file and make sure updates are handled by
-    // the callbacks.
+    // Load the per-game configuration file and make sure updates are handled
+    // by the callbacks.
     config::LoadGameConfig(title_id);
     assert_true(game_config_load_callback_loop_next_index_ == SIZE_MAX);
     game_config_load_callback_loop_next_index_ = 0;
@@ -802,7 +872,9 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
       XLanguage language =
           db.GetExistingLanguage(static_cast<XLanguage>(cvars::user_language));
       title_name_ = db.title(language);
+      XELOGI("Title name: {}", title_name_);
 
+      // Show achievments data
       XELOGI("-------------------- ACHIEVEMENTS --------------------");
       const std::vector<kernel::util::XdbfAchievementTableEntry>
           achievement_list = db.GetAchievements();
@@ -823,10 +895,10 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     }
   }
 
-  // Initializing the shader storage in a blocking way so the user doesn't miss
-  // the initial seconds - for instance, sound from an intro video may start
-  // playing before the video can be seen if doing this in parallel with the
-  // main thread.
+  // Initializing the shader storage in a blocking way so the user doesn't
+  // miss the initial seconds - for instance, sound from an intro video may
+  // start playing before the video can be seen if doing this in parallel with
+  // the main thread.
   on_shader_storage_initialization(true);
   graphics_system_->InitializeShaderStorage(cache_root_, title_id_.value(),
                                             true);

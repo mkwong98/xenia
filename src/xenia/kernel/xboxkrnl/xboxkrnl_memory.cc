@@ -17,6 +17,12 @@
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/xbox.h"
 
+DEFINE_bool(
+    ignore_offset_for_ranged_allocations, false,
+    "Allows to ignore 4k offset for physical allocations with provided range. "
+    "Certain titles check if result matches provided lower range.",
+    "Memory");
+
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
@@ -120,7 +126,9 @@ dword_result_t NtAllocateVirtualMemory_entry(lpdword_t base_addr_ptr,
   uint32_t adjusted_size = int32_t(*region_size_ptr) < 0
                                ? -int32_t(region_size_ptr.value())
                                : region_size_ptr.value();
-  adjusted_size = xe::round_up(adjusted_size, page_size);
+
+  adjusted_size =
+      xe::round_up(adjusted_size, adjusted_base ? page_size : 64 * 1024);
 
   // Allocate.
   uint32_t allocation_type = 0;
@@ -207,7 +215,7 @@ dword_result_t NtProtectVirtualMemory_entry(lpdword_t base_addr_ptr,
   if (protect_bits & (X_PAGE_EXECUTE | X_PAGE_EXECUTE_READ |
                       X_PAGE_EXECUTE_READWRITE | X_PAGE_EXECUTE_WRITECOPY)) {
     XELOGW("Game setting EXECUTE bit on protect");
-    return X_STATUS_ACCESS_DENIED;
+    return X_STATUS_INVALID_PAGE_PROTECTION;
   }
 
   auto heap = kernel_memory()->LookupHeap(*base_addr_ptr);
@@ -294,10 +302,19 @@ struct X_MEMORY_BASIC_INFORMATION {
   be<uint32_t> protect;
   be<uint32_t> type;
 };
-
+// chrispy: added region_type ? guessed name, havent seen any except 0 used
 dword_result_t NtQueryVirtualMemory_entry(
     dword_t base_address,
-    pointer_t<X_MEMORY_BASIC_INFORMATION> memory_basic_information_ptr) {
+    pointer_t<X_MEMORY_BASIC_INFORMATION> memory_basic_information_ptr,
+    dword_t region_type) {
+  switch (region_type) {
+    case 0:
+    case 1:
+    case 2:
+      break;
+    default:
+      return X_STATUS_INVALID_PARAMETER;
+  }
   auto heap = kernel_state()->memory()->LookupHeap(base_address);
   HeapAllocationInfo alloc_info;
   if (heap == nullptr || !heap->QueryRegionInfo(base_address, &alloc_info)) {
@@ -372,6 +389,14 @@ dword_result_t MmAllocatePhysicalMemoryEx_entry(
   // min_addr_range/max_addr_range are bounds in physical memory, not virtual.
   uint32_t heap_base = heap->heap_base();
   uint32_t heap_physical_address_offset = heap->GetPhysicalAddress(heap_base);
+  // TODO(Gliniak): Games like 545108B4 compares min_addr_range with value
+  // returned. 0x1000 offset causes it to go below that minimal range and goes
+  // haywire
+  if (min_addr_range && max_addr_range &&
+      cvars::ignore_offset_for_ranged_allocations) {
+    heap_physical_address_offset = 0;
+  }
+
   uint32_t heap_min_addr =
       xe::sat_sub(min_addr_range.value(), heap_physical_address_offset);
   uint32_t heap_max_addr =
@@ -425,8 +450,14 @@ DECLARE_XBOXKRNL_EXPORT2(MmQueryAddressProtect, kMemory, kImplemented,
 
 void MmSetAddressProtect_entry(lpvoid_t base_address, dword_t region_size,
                                dword_t protect_bits) {
-  if (!protect_bits) {
-    XELOGE("MmSetAddressProtect: Failed due to incorrect protect_bits");
+  constexpr uint32_t required_protect_bits =
+      X_PAGE_NOACCESS | X_PAGE_READONLY | X_PAGE_READWRITE |
+      X_PAGE_EXECUTE_READ | X_PAGE_EXECUTE_READWRITE;
+
+  if (xe::bit_count(protect_bits & required_protect_bits) != 1) {
+    // Many titles use invalid combination with zero valid bits set.
+    // We're skipping assertion for these cases to prevent unnecessary spam.
+    assert_false(xe::bit_count(protect_bits & required_protect_bits) > 1);
     return;
   }
 
@@ -494,35 +525,26 @@ dword_result_t MmQueryStatistics_entry(
   stats_ptr->size = size;
 
   stats_ptr->total_physical_pages = 0x00020000;  // 512mb / 4kb pages
-  stats_ptr->kernel_pages = 0x00000300;
+  stats_ptr->kernel_pages = 0x00000100; // Previous value 0x300
 
-  // TODO(gibbed): maybe use LookupHeapByType instead?
-  auto heap_a = kernel_memory()->LookupHeap(0xA0000000);
-  auto heap_c = kernel_memory()->LookupHeap(0xC0000000);
-  auto heap_e = kernel_memory()->LookupHeap(0xE0000000);
-
-  assert_not_null(heap_a);
-  assert_not_null(heap_c);
-  assert_not_null(heap_e);
-
-#define GET_USED_PAGE_COUNT(x) \
-  (x->GetTotalPageCount() - x->GetUnreservedPageCount())
-#define GET_USED_PAGE_SIZE(x) ((GET_USED_PAGE_COUNT(x) * x->page_size()) / 4096)
+  uint32_t reserved_pages = 0;
+  uint32_t unreserved_pages = 0;
   uint32_t used_pages = 0;
-  used_pages += GET_USED_PAGE_SIZE(heap_a);
-  used_pages += GET_USED_PAGE_SIZE(heap_c);
-  used_pages += GET_USED_PAGE_SIZE(heap_e);
-#undef GET_USED_PAGE_SIZE
-#undef GET_USED_PAGE_COUNT
+  uint32_t reserved_pages_bytes = 0;
+  const BaseHeap* physical_heaps[3] = {
+      kernel_memory()->LookupHeapByType(true, 0x1000),
+      kernel_memory()->LookupHeapByType(true, 0x10000),
+      kernel_memory()->LookupHeapByType(true, 0x1000000)};
+
+  kernel_memory()->GetHeapsPageStatsSummary(
+      physical_heaps, std::size(physical_heaps), reserved_pages,
+      unreserved_pages, used_pages, reserved_pages_bytes);
 
   assert_true(used_pages < stats_ptr->total_physical_pages);
-
   stats_ptr->title.available_pages =
-      stats_ptr->total_physical_pages - used_pages;
-  stats_ptr->title.total_virtual_memory_bytes =
-      0x2FFF0000;  // TODO(gibbed): FIXME
-  stats_ptr->title.reserved_virtual_memory_bytes =
-      0x00160000;                                // TODO(gibbed): FIXME
+      stats_ptr->total_physical_pages - stats_ptr->kernel_pages - used_pages;
+  stats_ptr->title.total_virtual_memory_bytes = 0x2FFE0000;
+  stats_ptr->title.reserved_virtual_memory_bytes = reserved_pages_bytes;
   stats_ptr->title.physical_pages = 0x00001000;  // TODO(gibbed): FIXME
   stats_ptr->title.pool_pages = 0x00000010;
   stats_ptr->title.stack_pages = 0x00000100;
@@ -594,6 +616,10 @@ dword_result_t ExAllocatePoolTypeWithTag_entry(dword_t size, dword_t tag,
   return addr;
 }
 DECLARE_XBOXKRNL_EXPORT1(ExAllocatePoolTypeWithTag, kMemory, kImplemented);
+dword_result_t ExAllocatePoolWithTag_entry(dword_t numbytes, dword_t tag) {
+  return ExAllocatePoolTypeWithTag_entry(numbytes, tag, 0);
+}
+DECLARE_XBOXKRNL_EXPORT1(ExAllocatePoolWithTag, kMemory, kImplemented);
 
 dword_result_t ExAllocatePool_entry(dword_t size) {
   const uint32_t none = 0x656E6F4E;  // 'None'

@@ -439,9 +439,7 @@ void InitializeLogging(const std::string_view app_name) {
   if (cvars::log_file.empty()) {
     // Default to app name.
     auto file_name = fmt::format("{}.log", app_name);
-    auto file_path = std::filesystem::path(file_name);
-    xe::filesystem::CreateParentFolder(file_path);
-
+    auto file_path = xe::filesystem::GetExecutableFolder() / file_name;
     log_file = xe::filesystem::OpenFile(file_path, "wt");
   } else {
     xe::filesystem::CreateParentFolder(cvars::log_file);
@@ -468,17 +466,16 @@ void ShutdownLogging() {
 }
 
 bool logging::internal::ShouldLog(LogLevel log_level) {
-  return logger_ != nullptr &&
-         static_cast<int32_t>(log_level) <= cvars::log_level;
+  return static_cast<int32_t>(log_level) <= cvars::log_level;
 }
 
 std::pair<char*, size_t> logging::internal::GetThreadBuffer() {
   return {thread_log_buffer_, sizeof(thread_log_buffer_)};
 }
-
+XE_NOALIAS
 void logging::internal::AppendLogLine(LogLevel log_level,
                                       const char prefix_char, size_t written) {
-  if (!ShouldLog(log_level) || !written) {
+  if (!logger_ || !ShouldLog(log_level) || !written) {
     return;
   }
   logger_->AppendLine(xe::threading::current_thread_id(), prefix_char,

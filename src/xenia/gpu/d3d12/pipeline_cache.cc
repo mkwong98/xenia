@@ -61,6 +61,10 @@ DEFINE_int32(
 DEFINE_bool(d3d12_tessellation_wireframe, false,
             "Display tessellated surfaces as wireframe for debugging.",
             "D3D12");
+DEFINE_bool(d3d12_remove_retc_from_geometry_shader, false,
+            "[ONLY FOR AMD 7900 Series GPU] Workaround for broken Geometry "
+            "Shader. Warning! Might cause issues and hardlocks!",
+            "D3D12");
 
 namespace xe {
 namespace gpu {
@@ -183,7 +187,7 @@ void PipelineCache::Shutdown() {
   // creating them.
   if (!creation_threads_.empty()) {
     {
-      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      std::lock_guard<xe_mutex> lock(creation_request_lock_);
       creation_threads_shutdown_from_ = 0;
     }
     creation_request_cond_.notify_all();
@@ -427,7 +431,9 @@ void PipelineCache::InitializeShaderStorage(
           ++shader_translation_threads_busy;
           break;
         }
-        shader_to_translate->AnalyzeUcode(ucode_disasm_buffer);
+        if (!shader_to_translate->is_ucode_analyzed()) {
+          shader_to_translate->AnalyzeUcode(ucode_disasm_buffer);
+        }
         // Translate each needed modification on this thread after performing
         // modification-independent analysis of the whole shader.
         uint64_t ucode_data_hash = shader_to_translate->ucode_data_hash();
@@ -679,7 +685,7 @@ void PipelineCache::InitializeShaderStorage(
       if (!creation_threads_.empty()) {
         // Submit the pipeline for creation to any available thread.
         {
-          std::lock_guard<std::mutex> lock(creation_request_lock_);
+          std::lock_guard<xe_mutex> lock(creation_request_lock_);
           creation_queue_.push_back(new_pipeline);
         }
         creation_request_cond_.notify_one();
@@ -693,7 +699,7 @@ void PipelineCache::InitializeShaderStorage(
       CreateQueuedPipelinesOnProcessorThread();
       if (creation_threads_.size() > creation_thread_original_count) {
         {
-          std::lock_guard<std::mutex> lock(creation_request_lock_);
+          std::lock_guard<xe_mutex> lock(creation_request_lock_);
           creation_threads_shutdown_from_ = creation_thread_original_count;
           // Assuming the queue is empty because of
           // CreateQueuedPipelinesOnProcessorThread.
@@ -706,7 +712,7 @@ void PipelineCache::InitializeShaderStorage(
         bool await_creation_completion_event;
         {
           // Cleanup so additional threads can be created later again.
-          std::lock_guard<std::mutex> lock(creation_request_lock_);
+          std::lock_guard<xe_mutex> lock(creation_request_lock_);
           creation_threads_shutdown_from_ = SIZE_MAX;
           // If the invocation is blocking, all the shader storage
           // initialization is expected to be done before proceeding, to avoid
@@ -811,7 +817,7 @@ void PipelineCache::EndSubmission() {
     // Await creation of all queued pipelines.
     bool await_creation_completion_event;
     {
-      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      std::lock_guard<xe_mutex> lock(creation_request_lock_);
       // Assuming the creation queue is already empty (because the processor
       // thread also worked on creating the leftover pipelines), so only check
       // if there are threads with pipelines currently being created.
@@ -832,7 +838,7 @@ bool PipelineCache::IsCreatingPipelines() {
   if (creation_threads_.empty()) {
     return false;
   }
-  std::lock_guard<std::mutex> lock(creation_request_lock_);
+  std::lock_guard<xe_mutex> lock(creation_request_lock_);
   return !creation_queue_.empty() || creation_threads_busy_ != 0;
 }
 
@@ -980,7 +986,9 @@ bool PipelineCache::ConfigurePipeline(
                   xenos::VertexShaderExportMode::kPosition2VectorsEdgeKill);
   assert_false(register_file_.Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
   if (!vertex_shader->is_translated()) {
-    vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
+    if (!vertex_shader->shader().is_ucode_analyzed()) {
+      vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
+    }
     if (!TranslateAnalyzedShader(*shader_translator_, *vertex_shader,
                                  dxbc_converter_, dxc_utils_, dxc_compiler_)) {
       XELOGE("Failed to translate the vertex shader!");
@@ -1004,7 +1012,9 @@ bool PipelineCache::ConfigurePipeline(
   }
   if (pixel_shader != nullptr) {
     if (!pixel_shader->is_translated()) {
-      pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
+      if (!pixel_shader->shader().is_ucode_analyzed()) {
+        pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
+      }
       if (!TranslateAnalyzedShader(*shader_translator_, *pixel_shader,
                                    dxbc_converter_, dxc_utils_,
                                    dxc_compiler_)) {
@@ -1041,8 +1051,7 @@ bool PipelineCache::ConfigurePipeline(
   PipelineDescription& description = runtime_description.description;
 
   if (current_pipeline_ != nullptr &&
-      !std::memcmp(&current_pipeline_->description.description, &description,
-                   sizeof(description))) {
+      current_pipeline_->description.description == description) {
     *pipeline_handle_out = current_pipeline_;
     *root_signature_out = runtime_description.root_signature;
     return true;
@@ -1053,8 +1062,7 @@ bool PipelineCache::ConfigurePipeline(
   auto found_range = pipelines_.equal_range(hash);
   for (auto it = found_range.first; it != found_range.second; ++it) {
     Pipeline* found_pipeline = it->second;
-    if (!std::memcmp(&found_pipeline->description.description, &description,
-                     sizeof(description))) {
+    if (found_pipeline->description.description == description) {
       current_pipeline_ = found_pipeline;
       *pipeline_handle_out = found_pipeline;
       *root_signature_out = found_pipeline->description.root_signature;
@@ -1072,7 +1080,7 @@ bool PipelineCache::ConfigurePipeline(
   if (!creation_threads_.empty()) {
     // Submit the pipeline for creation to any available thread.
     {
-      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      std::lock_guard<xe_mutex> lock(creation_request_lock_);
       creation_queue_.push_back(new_pipeline);
     }
     creation_request_cond_.notify_one();
@@ -2400,7 +2408,9 @@ void PipelineCache::CreateDxbcGeometryShader(
            dxbc::Src::R(0, 0b1110));
     a.OpOr(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX),
            dxbc::Src::R(0, dxbc::Src::kYYYY));
-    a.OpRetC(true, dxbc::Src::R(0, dxbc::Src::kXXXX));
+    if (!cvars::d3d12_remove_retc_from_geometry_shader) {
+      a.OpRetC(true, dxbc::Src::R(0, dxbc::Src::kXXXX));
+    }
   }
 
   // Cull the whole primitive if any cull distance for all vertices in the
@@ -2426,7 +2436,9 @@ void PipelineCache::CreateDxbcGeometryShader(
         a.OpAnd(dxbc::Dest::R(0, 0b0001), dxbc::Src::R(0, dxbc::Src::kXXXX),
                 dxbc::Src::R(0, dxbc::Src::kYYYY));
       }
-      a.OpRetC(true, dxbc::Src::R(0, dxbc::Src::kXXXX));
+      if (!cvars::d3d12_remove_retc_from_geometry_shader) {
+        a.OpRetC(true, dxbc::Src::R(0, dxbc::Src::kXXXX));
+      }
     }
   }
 
@@ -2469,7 +2481,9 @@ void PipelineCache::CreateDxbcGeometryShader(
       for (uint32_t i = 0; i < 2; ++i) {
         a.OpLT(dxbc::Dest::R(0, 0b0100), dxbc::Src::LF(0.0f),
                point_size_src.SelectFromSwizzled(i));
-        a.OpRetC(false, dxbc::Src::R(0, dxbc::Src::kZZZZ));
+        if (!cvars::d3d12_remove_retc_from_geometry_shader) {
+          a.OpRetC(false, dxbc::Src::R(0, dxbc::Src::kZZZZ));
+        }
       }
       // Transform the diameter in the guest screen coordinates to radius in the
       // normalized device coordinates, and then to the clip space by
@@ -3310,7 +3324,7 @@ void PipelineCache::CreationThread(size_t thread_index) {
     // Check if need to shut down or set the completion event and dequeue the
     // pipeline if there is any.
     {
-      std::unique_lock<std::mutex> lock(creation_request_lock_);
+      std::unique_lock<xe_mutex> lock(creation_request_lock_);
       if (thread_index >= creation_threads_shutdown_from_ ||
           creation_queue_.empty()) {
         if (creation_completion_set_event_ && creation_threads_busy_ == 0) {
@@ -3341,7 +3355,7 @@ void PipelineCache::CreationThread(size_t thread_index) {
     // completion event if needed (at the next iteration, or in some other
     // thread).
     {
-      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      std::lock_guard<xe_mutex> lock(creation_request_lock_);
       --creation_threads_busy_;
     }
   }
@@ -3352,7 +3366,7 @@ void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
   while (true) {
     Pipeline* pipeline_to_create;
     {
-      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      std::lock_guard<xe_mutex> lock(creation_request_lock_);
       if (creation_queue_.empty()) {
         break;
       }

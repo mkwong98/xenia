@@ -62,6 +62,12 @@ filter({"configurations:Checked", "platforms:Linux"})
   defines({
     "_GLIBCXX_DEBUG",   -- libstdc++ debug mode
   })
+filter({"configurations:Release", "platforms:Windows"})
+	buildoptions({
+		"/Gw", 
+		"/GS-", 
+		"/Oy"
+	})
 
 filter("configurations:Debug")
   runtime("Release")
@@ -292,6 +298,7 @@ workspace("xenia")
   include("src/xenia/hid")
   include("src/xenia/hid/nop")
   include("src/xenia/kernel")
+  include("src/xenia/patcher")
   include("src/xenia/ui")
   include("src/xenia/ui/vulkan")
   include("src/xenia/vfs")

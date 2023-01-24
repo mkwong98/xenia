@@ -94,7 +94,7 @@ DEFINE_bool(mount_cache, false, "Enable cache mount", "Storage");
 DEFINE_transient_path(target, "",
                       "Specifies the target .xex or .iso to execute.",
                       "General");
-DEFINE_transient_bool(portable, false,
+DEFINE_transient_bool(portable, true,
                       "Specifies if Xenia should run in portable mode.",
                       "General");
 
@@ -379,6 +379,9 @@ std::vector<std::unique_ptr<hid::InputDriver>> EmulatorApp::CreateInputDrivers(
 }
 
 bool EmulatorApp::OnInitialize() {
+#if XE_ARCH_AMD64 == 1
+  amd64::InitFeatureFlags();
+#endif
   Profiler::Initialize();
   Profiler::ThreadEnter("Main");
 
@@ -587,6 +590,10 @@ void EmulatorApp::EmulatorThread() {
           emulator_window_->SetInitializingShaderStorage(initializing);
         });
       });
+
+  emulator_->on_patch_apply.AddListener([this]() {
+    app_context().CallInUIThread([this]() { emulator_window_->UpdateTitle(); });
+  });
 
   emulator_->on_terminate.AddListener([]() {
     if (cvars::discord) {

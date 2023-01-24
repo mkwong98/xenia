@@ -175,6 +175,27 @@ bool Processor::AddModule(std::unique_ptr<Module> module) {
   return true;
 }
 
+void Processor::RemoveModule(const std::string_view name) {
+  auto global_lock = global_critical_region_.Acquire();
+
+  auto itr =
+      std::find_if(modules_.cbegin(), modules_.cend(),
+                   [name](std::unique_ptr<xe::cpu::Module> const& module) {
+                     return module->name() == name;
+                   });
+
+  if (itr != modules_.cend()) {
+    const std::vector<uint32_t> addressed_functions =
+        (*itr)->GetAddressedFunctions();
+
+    modules_.erase(itr);
+
+    for (const uint32_t entry : addressed_functions) {
+      RemoveFunctionByAddress(entry);
+    }
+  }
+}
+
 Module* Processor::GetModule(const std::string_view name) {
   auto global_lock = global_critical_region_.Acquire();
   for (const auto& module : modules_) {
@@ -224,6 +245,10 @@ std::vector<Function*> Processor::FindFunctionsWithAddress(uint32_t address) {
   return entry_table_.FindWithAddress(address);
 }
 
+void Processor::RemoveFunctionByAddress(uint32_t address) {
+  entry_table_.Delete(address);
+}
+
 Function* Processor::ResolveFunction(uint32_t address) {
   Entry* entry;
   Entry::Status status = entry_table_.GetOrCreate(address, &entry);
@@ -232,6 +257,7 @@ Function* Processor::ResolveFunction(uint32_t address) {
 
     // Grab symbol declaration.
     auto function = LookupFunction(address);
+
     if (!function) {
       entry->status = Entry::STATUS_FAILED;
       return nullptr;
@@ -241,6 +267,17 @@ Function* Processor::ResolveFunction(uint32_t address) {
       entry->status = Entry::STATUS_FAILED;
       return nullptr;
     }
+    //only add it to the list of resolved functions if resolving succeeded
+    auto module_for = function->module();
+
+    auto xexmod = dynamic_cast<XexModule*>(module_for);
+    if (xexmod) {
+      auto addr_flags = xexmod->GetInstructionAddressFlags(address);
+      if (addr_flags) {
+        addr_flags->was_resolved = 1;
+      }
+    }
+
     entry->function = function;
     entry->end_address = function->end_address();
     status = entry->status = Entry::STATUS_READY;
@@ -253,23 +290,23 @@ Function* Processor::ResolveFunction(uint32_t address) {
     return nullptr;
   }
 }
-
+Module* Processor::LookupModule(uint32_t address) {
+  auto global_lock = global_critical_region_.Acquire();
+  // TODO(benvanik): sort by code address (if contiguous) so can bsearch.
+  // TODO(benvanik): cache last module low/high, as likely to be in there.
+  for (const auto& module : modules_) {
+    if (module->ContainsAddress(address)) {
+      return module.get();
+    }
+  }
+  return nullptr;
+}
 Function* Processor::LookupFunction(uint32_t address) {
   // TODO(benvanik): fast reject invalid addresses/log errors.
 
   // Find the module that contains the address.
-  Module* code_module = nullptr;
-  {
-    auto global_lock = global_critical_region_.Acquire();
-    // TODO(benvanik): sort by code address (if contiguous) so can bsearch.
-    // TODO(benvanik): cache last module low/high, as likely to be in there.
-    for (const auto& module : modules_) {
-      if (module->ContainsAddress(address)) {
-        code_module = module.get();
-        break;
-      }
-    }
-  }
+  Module* code_module = LookupModule(address);
+
   if (!code_module) {
     // No module found that could contain the address.
     return nullptr;
@@ -508,9 +545,7 @@ void Processor::OnThreadDestroyed(uint32_t thread_id) {
   auto global_lock = global_critical_region_.Acquire();
   auto it = thread_debug_infos_.find(thread_id);
   assert_true(it != thread_debug_infos_.end());
-  auto thread_info = it->second.get();
-  thread_info->state = ThreadDebugInfo::State::kZombie;
-  thread_info->thread = nullptr;
+  thread_debug_infos_.erase(it);
 }
 
 void Processor::OnThreadEnteringWait(uint32_t thread_id) {

@@ -107,7 +107,34 @@ class KernelState {
   xam::ContentManager* content_manager() const {
     return content_manager_.get();
   }
-  xam::UserProfile* user_profile() const { return user_profile_.get(); }
+
+  uint8_t GetConnectedUsers() const;
+  void UpdateUsedUserProfiles();
+
+  bool IsUserSignedIn(uint32_t index) const {
+    return user_profiles_.find(index) != user_profiles_.cend();
+  }
+
+  bool IsUserSignedIn(uint64_t xuid) const {
+    return user_profile(xuid) != nullptr;
+  }
+
+  xam::UserProfile* user_profile(uint32_t index) const {
+    if (!IsUserSignedIn(index)) {
+      return nullptr;
+    }
+
+    return user_profiles_.at(index).get();
+  }
+
+  xam::UserProfile* user_profile(uint64_t xuid) const {
+    for (const auto& [key, value] : user_profiles_) {
+      if (value->xuid() == xuid) {
+        return user_profiles_.at(key).get();
+      }
+    }
+    return nullptr;
+  }
 
   // Access must be guarded by the global critical region.
   util::ObjectTable* object_table() { return &object_table_; }
@@ -137,6 +164,8 @@ class KernelState {
   void SetExecutableModule(object_ref<UserModule> module);
   object_ref<UserModule> LoadUserModule(const std::string_view name,
                                         bool call_entry = true);
+  X_RESULT FinishLoadingUserModule(const object_ref<UserModule> module,
+                                   bool call_entry = true);
   void UnloadUserModule(const object_ref<UserModule>& module,
                         bool call_entry = true);
 
@@ -153,6 +182,7 @@ class KernelState {
     return object_ref<T>(reinterpret_cast<T*>(module.release()));
   }
 
+  X_RESULT ApplyTitleUpdate(const object_ref<UserModule> module);
   // Terminates a title: Unloads all modules, and kills all guest threads.
   // This DOES NOT RETURN if called from a guest thread!
   void TerminateTitle();
@@ -209,7 +239,7 @@ class KernelState {
 
   std::unique_ptr<xam::AppManager> app_manager_;
   std::unique_ptr<xam::ContentManager> content_manager_;
-  std::unique_ptr<xam::UserProfile> user_profile_;
+  std::map<uint8_t, std::unique_ptr<xam::UserProfile>> user_profiles_;
 
   xe::global_critical_region global_critical_region_;
 
