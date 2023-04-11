@@ -59,6 +59,9 @@ DECLARE_bool(d3d12_clear_memory_page_state);
 DEFINE_bool(fullscreen, false, "Whether to launch the emulator in fullscreen.",
             "Display");
 
+DEFINE_bool(controller_hotkeys, true,
+            "Hotkeys for Xbox and PS controllers.", "General");
+
 DEFINE_string(
     postprocess_antialiasing, "",
     "Post-processing anti-aliasing effect to apply to the image output of the "
@@ -135,6 +138,11 @@ DEFINE_bool(
     "depends on the 10bpc displaying capabilities of the actual display used.",
     "Display");
 
+DEFINE_int32(recent_titles_entry_amount, 10,
+             "Allows user to define how many titles is saved in list of "
+             "recently played titles.",
+             "General");
+
 namespace xe {
 namespace app {
 
@@ -146,6 +154,7 @@ using xe::ui::UIEvent;
 using namespace xe::hid;
 using namespace xe::gpu;
 
+const std::string kRecentlyPlayedTitlesFilename = "recent.toml";
 const std::string kBaseTitle = "Xenia-canary";
 
 EmulatorWindow::EmulatorWindow(Emulator* emulator,
@@ -174,7 +183,7 @@ EmulatorWindow::EmulatorWindow(Emulator* emulator,
                 XE_BUILD_BRANCH "@" XE_BUILD_COMMIT_SHORT " on " XE_BUILD_DATE
                 ")";
 
-  ReadRecentlyLaunchedTitles();
+  LoadRecentlyLaunchedTitles();
 }
 
 std::unique_ptr<EmulatorWindow> EmulatorWindow::Create(
@@ -244,7 +253,9 @@ void EmulatorWindow::OnEmulatorInitialized() {
   }
 
   if (IsUseNexusForGameBarEnabled()) {
-    XELOGE("Xbox Gamebar Enabled, using BACK button instead of GUIDE!!!");
+    XELOGE(
+        "Xbox Gamebar Enabled, using BACK button instead of GUIDE for "
+        "controller hotkeys!!!");
   }
 
   // Create a thread to listen for controller hotkeys.
@@ -1184,11 +1195,11 @@ const std::map<int, EmulatorWindow::ControllerHotKey> controller_hotkey_map = {
     {X_INPUT_GAMEPAD_DPAD_DOWN,
      EmulatorWindow::ControllerHotKey(
          EmulatorWindow::ButtonFunctions::IncTitleSelect,
-         "D-PAD Down + Guide = Title Selection +1", true, false)},
+         "D-PAD Down = Title Selection +1", true, false)},
     {X_INPUT_GAMEPAD_DPAD_UP,
      EmulatorWindow::ControllerHotKey(
          EmulatorWindow::ButtonFunctions::DecTitleSelect,
-         "D-PAD Up + Guide = Title Selection -1", true, false)}};
+         "D-PAD Up = Title Selection -1", true, false)}};
 
 EmulatorWindow::ControllerHotKey EmulatorWindow::ProcessControllerHotkey(
     int buttons) {
@@ -1217,8 +1228,11 @@ EmulatorWindow::ControllerHotKey EmulatorWindow::ProcessControllerHotkey(
 
   // Do not activate hotkeys that are not intended for activation during
   // gameplay
-  if (emulator_->is_title_open() && !it->second.title_passthru) {
-    return Unknown_hotkey;
+  if (emulator_->is_title_open()) {
+    // If non-pass through (menu hoykeys) or hotkeys disabled then return
+    if (!it->second.title_passthru || !cvars::controller_hotkeys) {
+      return Unknown_hotkey;
+    }
   }
 
   EmulatorWindow::ControllerHotKey button_combination = it->second;
@@ -1233,15 +1247,11 @@ EmulatorWindow::ControllerHotKey EmulatorWindow::ProcessControllerHotkey(
     case ButtonFunctions::RunTitle: {
       if (selected_title_index == -1) selected_title_index++;
 
-      xe::X_STATUS title_success = RunTitle(
-          recently_launched_titles_[selected_title_index].path_to_file);
+      app_context().CallInUIThread([this]() {
+        RunTitle(recently_launched_titles_[selected_title_index].path_to_file);
+      });
 
-      if (title_success == X_ERROR_SUCCESS) {
-        imgui_drawer_.get()->ClearDialogs();
-      }
-    }
-    // RunPreviouslyPlayedTitle();
-    break;
+    } break;
     case ButtonFunctions::ClearMemoryPageState:
       ToggleGPUSetting(gpu_cvar::ClearMemoryPageState);
 
@@ -1299,6 +1309,7 @@ EmulatorWindow::ControllerHotKey EmulatorWindow::ProcessControllerHotkey(
     selected_title_index = std::clamp(
         selected_title_index, 0, (int)recently_launched_titles_.size() - 1);
 
+    // Must clear dialogs to prevent stacking
     imgui_drawer_.get()->ClearDialogs();
 
     // Titles may contain Unicode characters such as At World’s End
@@ -1326,7 +1337,7 @@ void EmulatorWindow::VibrateController(xe::hid::InputSystem* input_sys,
   // otherwise the rumble may fail.
   auto input_lock = input_sys->lock();
 
-  X_INPUT_VIBRATION vibration{};
+  X_INPUT_VIBRATION vibration = {};
 
   vibration.left_motor_speed = toggle_rumble ? UINT16_MAX : 0;
   vibration.right_motor_speed = toggle_rumble ? UINT16_MAX : 0;
@@ -1346,9 +1357,6 @@ void EmulatorWindow::GamepadHotKeys() {
 
   auto input_sys = emulator_->input_system();
 
-  // uint8_t users = emulator_->kernel_state()->GetConnectedUsers();
-  // uint8_t users = input_sys->GetConnectedSlots();
-
   if (input_sys) {
     while (true) {
       auto input_lock = input_sys->lock();
@@ -1356,11 +1364,11 @@ void EmulatorWindow::GamepadHotKeys() {
       for (uint32_t user_index = 0; user_index < MAX_USERS; ++user_index) {
         X_RESULT result = input_sys->GetState(user_index, &state);
 
+        // Release the lock before processing the hotkey
+        input_lock.mutex()->unlock();
+
         // Check if the controller is connected
         if (result == X_ERROR_SUCCESS) {
-          // Release the lock before processing the hotkey
-          input_lock.mutex()->unlock();
-
           if (ProcessControllerHotkey(state.gamepad.buttons).rumble) {
             // Enable Vibration
             VibrateController(input_sys, user_index, true);
@@ -1407,6 +1415,10 @@ bool EmulatorWindow::IsUseNexusForGameBarEnabled() {
 #endif
 }
 
+std::string EmulatorWindow::BoolToString(bool value) {
+  return std::string(value ? "true" : "false");
+}
+
 void EmulatorWindow::DisplayHotKeysConfig() {
   std::string msg = "";
   std::string msg_passthru = "";
@@ -1427,6 +1439,10 @@ void EmulatorWindow::DisplayHotKeysConfig() {
       pretty_text += " (Disabled)";
     }
 
+    if (val.title_passthru && !cvars::controller_hotkeys) {
+      pretty_text += " (Disabled)";
+    }
+
     if (val.title_passthru) {
       msg += pretty_text + "\n";
     } else {
@@ -1440,26 +1456,29 @@ void EmulatorWindow::DisplayHotKeysConfig() {
   // Prepend non-passthru hotkeys
   msg_passthru += "\n";
   msg.insert(0, msg_passthru);
-
   msg += "\n";
-  msg += "Readback Resolve: " +
-         std::string(cvars::d3d12_readback_resolve ? "true\n" : "false\n");
-  msg +=
-      "Clear Memory Page State: " +
-      std::string(cvars::d3d12_clear_memory_page_state ? "true\n" : "false\n");
+
+  msg += "Readback Resolve: " + BoolToString(cvars::d3d12_readback_resolve);
+  msg += "\n";
+
+  msg += "Clear Memory Page State: " +
+         BoolToString(cvars::d3d12_clear_memory_page_state);
+  msg += "\n";
+
+  msg += "Controller Hotkeys: " + BoolToString(cvars::controller_hotkeys);
 
   imgui_drawer_.get()->ClearDialogs();
-
   xe::ui::ImGuiDialog::ShowMessageBox(imgui_drawer_.get(), "Controller Hotkeys",
                                       msg);
 }
 
-xe::X_STATUS EmulatorWindow::RunTitle(std::filesystem::path path) {
-  bool titleExists = !std::filesystem::exists(path);
+xe::X_STATUS EmulatorWindow::RunTitle(std::filesystem::path path_to_file) {
+  bool titleExists = !std::filesystem::exists(path_to_file);
 
-  if (path.empty() || titleExists) {
-    char* log_msg = path.empty() ? "Failed to launch title path is empty."
-                                 : "Failed to launch title path is invalid.";
+  if (path_to_file.empty() || titleExists) {
+    char* log_msg = path_to_file.empty()
+                        ? "Failed to launch title path is empty."
+                        : "Failed to launch title path is invalid.";
 
     XELOGE(log_msg);
 
@@ -1482,8 +1501,10 @@ xe::X_STATUS EmulatorWindow::RunTitle(std::filesystem::path path) {
 
   // Prevent crashing the emulator by not loading a game if a game is already
   // loaded.
-  auto abs_path = std::filesystem::absolute(path);
+  auto abs_path = std::filesystem::absolute(path_to_file);
   auto result = emulator_->LaunchPath(abs_path);
+
+  imgui_drawer_.get()->ClearDialogs();
 
   if (result) {
     XELOGE("Failed to launch target: {:08X}", result);
@@ -1492,7 +1513,7 @@ xe::X_STATUS EmulatorWindow::RunTitle(std::filesystem::path path) {
         imgui_drawer_.get(), "Title Launch Failed!",
         "Failed to launch title.\n\nCheck xenia.log for technical details.");
   } else {
-    AddRecentlyLaunchedTitle(path, emulator_->title_name());
+    AddRecentlyLaunchedTitle(path_to_file, emulator_->title_name());
   }
 
   return result;
@@ -1506,23 +1527,23 @@ void EmulatorWindow::RunPreviouslyPlayedTitle() {
 
 void EmulatorWindow::FillRecentlyLaunchedTitlesMenu(
     xe::ui::MenuItem* recent_menu) {
-  unsigned int index = 0;
-  for (const auto& [title_name, path] : recently_launched_titles_) {
-    if (index == 0) {
-      recent_menu->AddChild(
-          MenuItem::Create(MenuItem::Type::kString, title_name, "F9",
-                           std::bind(&EmulatorWindow::RunTitle, this, path)));
-    } else {
-      recent_menu->AddChild(
-          MenuItem::Create(MenuItem::Type::kString, title_name,
-                           std::bind(&EmulatorWindow::RunTitle, this, path)));
-    }
-    index++;
+  for (int i = 0; i < recently_launched_titles_.size(); ++i) {
+    std::string hotkey = (i == 0) ? "F9" : "";
+
+    const RecentTitleEntry& entry = recently_launched_titles_[i];
+    const std::string item_text = entry.title_name.empty()
+                                      ? entry.path_to_file.string()
+                                      : entry.title_name;
+
+    recent_menu->AddChild(MenuItem::Create(
+        MenuItem::Type::kString, item_text, hotkey,
+        std::bind(&EmulatorWindow::RunTitle, this, entry.path_to_file)));
   }
 }
 
-void EmulatorWindow::ReadRecentlyLaunchedTitles() {
-  std::ifstream file(emulator()->storage_root() / "recent.toml");
+void EmulatorWindow::LoadRecentlyLaunchedTitles() {
+  std::ifstream file(emulator()->storage_root() /
+                     kRecentlyPlayedTitlesFilename);
   if (!file.is_open()) {
     return;
   }
@@ -1538,10 +1559,23 @@ void EmulatorWindow::ReadRecentlyLaunchedTitles() {
 
   if (parsed_file->is_table()) {
     for (const auto& [index, entry] : *parsed_file->as_table()) {
-      for (const auto& [title_name, path] : *entry->as_table()) {
-        recently_launched_titles_.push_back(
-            {title_name, path->as<std::string>()->get()});
+      if (!entry->is_table()) {
+        continue;
       }
+
+      const std::shared_ptr<cpptoml::table> entry_table = entry->as_table();
+
+      std::string title_name = *entry_table->get_as<std::string>("title_name");
+      std::string path = *entry_table->get_as<std::string>("path");
+      std::time_t last_run_time =
+          *entry_table->get_as<uint64_t>("last_run_time");
+
+      std::error_code ec = {};
+      if (path.empty() || !std::filesystem::exists(path, ec)) {
+        continue;
+      }
+
+      recently_launched_titles_.push_back({title_name, path, last_run_time});
     }
   }
 }
@@ -1559,31 +1593,31 @@ void EmulatorWindow::AddRecentlyLaunchedTitle(
   }
 
   recently_launched_titles_.insert(recently_launched_titles_.cbegin(),
-                                   {title_name, path_to_file});
+                                   {title_name, path_to_file, time(nullptr)});
   // Serialize to toml
   auto toml_table = cpptoml::make_table();
 
-  const uint8_t amount_of_stored_entries = 10;
   uint8_t index = 0;
-
-  for (const auto& [title_name, path] : recently_launched_titles_) {
+  for (const RecentTitleEntry& entry : recently_launched_titles_) {
     auto entry_table = cpptoml::make_table();
 
     // Fill entry under specific index.
-    std::string str_path = xe::path_to_utf8(path);
-    entry_table->insert(title_name.empty() ? str_path : title_name, str_path);
+    std::string str_path = xe::path_to_utf8(entry.path_to_file);
+    entry_table->insert("title_name", entry.title_name);
+    entry_table->insert("path", str_path);
+    entry_table->insert("last_run_time", entry.last_run_time);
     entry_table->end();
 
     toml_table->insert(std::to_string(index++), entry_table);
 
-    if (index >= amount_of_stored_entries) {
+    if (index >= cvars::recent_titles_entry_amount) {
       break;
     }
   }
   toml_table->end();
 
   // Open and write serialized data.
-  std::ofstream file(emulator()->storage_root() / "recent.toml",
+  std::ofstream file(emulator()->storage_root() / kRecentlyPlayedTitlesFilename,
                      std::ofstream::trunc);
   file << *toml_table;
   file.close();

@@ -52,6 +52,7 @@ KernelState::KernelState(Emulator* emulator)
   file_system_ = emulator->file_system();
 
   app_manager_ = std::make_unique<xam::AppManager>();
+  achievement_manager_ = std::make_unique<AchievementManager>();
   user_profiles_.emplace(0, std::make_unique<xam::UserProfile>(0));
 
   auto content_root = emulator_->content_root();
@@ -141,7 +142,17 @@ void KernelState::set_process_type(uint32_t value) {
 
 uint32_t KernelState::AllocateTLS() { return uint32_t(tls_bitmap_.Acquire()); }
 
-void KernelState::FreeTLS(uint32_t slot) { tls_bitmap_.Release(slot); }
+void KernelState::FreeTLS(uint32_t slot) {
+  const std::vector<object_ref<XThread>> threads =
+      object_table()->GetObjectsByType<XThread>();
+
+  for (const object_ref<XThread>& thread : threads) {
+    if (thread->is_guest_thread()) {
+      thread->SetTLSValue(slot, 0);
+    }
+  }
+  tls_bitmap_.Release(slot);
+}
 
 void KernelState::RegisterTitleTerminateNotification(uint32_t routine,
                                                      uint32_t priority) {
@@ -483,10 +494,13 @@ X_RESULT KernelState::ApplyTitleUpdate(const object_ref<UserModule> module) {
   X_RESULT open_status =
       content_manager()->OpenContent("UPDATE", title_update, disc_number);
 
+  // Use the corresponding patch for the launch module
+  std::filesystem::path patch_xexp = fmt::format("{0}.xexp", module->name());
+
   std::string resolved_path = "";
   file_system()->FindSymbolicLink("UPDATE:", resolved_path);
   xe::vfs::Entry* patch_entry = kernel_state()->file_system()->ResolvePath(
-      resolved_path + "default.xexp");
+      resolved_path + patch_xexp.generic_string());
 
   if (patch_entry) {
     const std::string patch_path = patch_entry->absolute_path();
