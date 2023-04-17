@@ -63,18 +63,38 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
 
   bool any_connected = false;
+  bool is_first = true;
+  X_INPUT_GAMEPAD kb_pad;
   for (auto& driver : drivers_) {
     X_RESULT result = driver->GetState(user_index, out_state);
     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
       any_connected = true;
-    }
-    if (result == X_ERROR_SUCCESS) {
-      UpdateUsedSlot(user_index, any_connected);
-      return result;
+      if (result == X_ERROR_SUCCESS) {
+        UpdateUsedSlot(user_index, any_connected);
+        if (is_first) {
+          //keyboard, keep a copy
+          is_first = false;
+          kb_pad = out_state->gamepad; 
+        } else {
+          //add keyboard state of buttons and triggers
+          out_state->gamepad.buttons =
+              out_state->gamepad.buttons | kb_pad.buttons; 
+          out_state->gamepad.left_trigger =
+              out_state->gamepad.left_trigger | kb_pad.left_trigger;
+          out_state->gamepad.right_trigger =
+              out_state->gamepad.right_trigger | kb_pad.right_trigger;
+          return result;
+        }
+      }
     }
   }
-  UpdateUsedSlot(user_index, any_connected);
-  return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+  if (!is_first) {
+    //return keyboard success
+    return X_ERROR_SUCCESS;
+  } else {
+    UpdateUsedSlot(user_index, any_connected);
+    return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+  }
 }
 
 X_RESULT InputSystem::SetState(uint32_t user_index,
