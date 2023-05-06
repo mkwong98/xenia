@@ -17,10 +17,12 @@
 #include <memory>
 #include <vector>
 
+#include "achievement_manager.h"
 #include "xenia/base/bit_map.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/mutex.h"
 #include "xenia/cpu/export_resolver.h"
+#include "xenia/kernel/util/kernel_fwd.h"
 #include "xenia/kernel/util/native_list.h"
 #include "xenia/kernel/util/object_table.h"
 #include "xenia/kernel/util/xdbf_utils.h"
@@ -30,7 +32,6 @@
 #include "xenia/memory.h"
 #include "xenia/vfs/virtual_file_system.h"
 #include "xenia/xbox.h"
-#include "achievement_manager.h"
 
 namespace xe {
 class ByteStream;
@@ -44,14 +45,6 @@ namespace xe {
 namespace kernel {
 
 constexpr fourcc_t kKernelSaveSignature = make_fourcc("KRNL");
-
-class Dispatcher;
-class XHostThread;
-class KernelModule;
-class XModule;
-class XNotifyListener;
-class XThread;
-class UserModule;
 
 // (?), used by KeGetCurrentProcessType
 constexpr uint32_t X_PROCTYPE_IDLE = 0;
@@ -86,6 +79,17 @@ struct ProcessInfoBlock {
 struct TerminateNotification {
   uint32_t guest_routine;
   uint32_t priority;
+};
+
+// structure for KeTimeStampBuindle
+// a bit like the timers on KUSER_SHARED on normal win32
+// https://www.geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/ntexapi_x/kuser_shared_data/index.htm
+struct X_TIME_STAMP_BUNDLE {
+  uint64_t interrupt_time;
+  // i assume system_time is in 100 ns intervals like on win32
+  uint64_t system_time;
+  uint32_t tick_count;
+  uint32_t padding;
 };
 
 class KernelState {
@@ -234,6 +238,14 @@ class KernelState {
   bool Restore(ByteStream* stream);
 
   uint32_t notification_position_ = 2;
+
+  uint32_t GetKeTimestampBundle();
+
+  XE_NOINLINE
+  XE_COLD
+  uint32_t CreateKeTimestampBundle();
+  void UpdateKeTimestampBundle();
+
  private:
   void LoadKernelModule(object_ref<KernelModule> kernel_module);
 
@@ -271,8 +283,15 @@ class KernelState {
   std::list<std::function<void()>> dispatch_queue_;
 
   BitMap tls_bitmap_;
+  uint32_t ke_timestamp_bundle_ptr_ = 0;
+  std::unique_ptr<xe::threading::HighResolutionTimer> timestamp_timer_;
+  //fixed address referenced by dashboards. Data is currently unknown
+  uint32_t strange_hardcoded_page_ = 0x8E038634 & (~0xFFFF);
+  uint32_t strange_hardcoded_location_ = 0x8E038634;
 
   friend class XObject;
+public:
+  uint32_t dash_context_ = 0;
 };
 
 }  // namespace kernel
